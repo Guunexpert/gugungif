@@ -3,8 +3,7 @@ const { Client, GatewayIntentBits, REST, Routes, Collection } = require('discord
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
+const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds],
@@ -39,17 +38,25 @@ for (const file of commandFiles) {
     }
 }
 
-const rest = new REST({ version: '10' }).setToken(TOKEN || '');
-(async () => {
-    try {
-        await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commandsData });
-        console.log(greenLog('gugun running'));
-    } catch (error) {
-        console.error(error);
-    }
-})();
-
 client.on('interactionCreate', async interaction => {
+    if (interaction.isButton()) {
+        const [commandName] = interaction.customId.split(':');
+        const command = client.commands.get(commandName);
+        if (command?.handleComponent) {
+            try {
+                await command.handleComponent(interaction, client);
+            } catch (error) {
+                console.error(error);
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ content: 'Failed to process media selection.', components: [] });
+                } else {
+                    await interaction.reply({ content: 'Failed to process media selection.', ephemeral: true });
+                }
+            }
+        }
+        return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     const command = client.commands.get(interaction.commandName);
@@ -79,6 +86,11 @@ client.on('interactionCreate', async interaction => {
 });
 
 client.once('ready', () => {
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    rest.put(Routes.applicationCommands(client.user.id), { body: commandsData })
+        .then(() => console.log(greenLog('Slash commands registered')))
+        .catch(error => console.error(redLog(`[COMMANDS] Failed to register slash commands: ${error.message}`)));
+
     console.log(greenLog(`==============================================`));
     console.log(greenLog(`Bot nya jalankan dengan aman, jangan lupa join KC`));
     console.log(greenLog(`security kernel active as ${client.user.tag}`));
@@ -105,5 +117,9 @@ client.once('ready', () => {
         console.log(greenLog(randomLogFunction()));
     }, 4000);
 });
+
+if (!TOKEN) {
+    throw new Error('DISCORD_TOKEN (atau TOKEN) belum diatur di file .env.');
+}
 
 client.login(TOKEN);
