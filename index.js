@@ -40,7 +40,8 @@ for (const file of commandFiles) {
 
 client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
-        const [commandName] = interaction.customId.split(':');
+        const [actionName] = interaction.customId.split(':');
+        const commandName = actionName === 'convert_media' ? 'convert' : actionName;
         const command = client.commands.get(commandName);
         if (command?.handleComponent) {
             try {

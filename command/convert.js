@@ -3,9 +3,10 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const sharp = require('sharp');
 const axios = require('axios');
-const ytDlp = require('yt-dlp-exec');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 const pendingSelections = new Map();
 const platformHosts = new Set([
@@ -13,12 +14,44 @@ const platformHosts = new Set([
     'instagram.com', 'www.instagram.com',
     'facebook.com', 'www.facebook.com', 'fb.watch'
 ]);
+const ytDlpPath = path.join(__dirname, '../', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
 if (!ffmpegPath) {
     throw new Error('FFmpeg binary is not available from the ffmpeg-static package.');
 }
 
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+function withTimeout(promise, milliseconds, message) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), milliseconds);
+    });
+
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function sendResult(interaction, payload) {
+    if (payload && (payload.files || payload.components) && interaction.channel?.send) {
+        try {
+            await withTimeout(
+                interaction.channel.send(payload),
+                30000,
+                'Channel file upload timed out'
+            );
+            console.log('[CONVERT] Result sent to channel');
+            return;
+        } catch (error) {
+            console.error('[CONVERT] Channel result failed:', error.message);
+        }
+    }
+
+    try {
+        await withTimeout(interaction.followUp({ content: payload, ephemeral: true }), 30000, 'Discord follow-up timed out');
+    } catch (error) {
+        console.error('[CONVERT] Follow-up failed:', error.message);
+    }
+}
 
 function cleanupFiles(inPath, outPath) {
     if (inPath && fs.existsSync(inPath)) fs.unlinkSync(inPath);
@@ -51,6 +84,61 @@ function getMediaEntries(info) {
     return mediaEntries.filter(entry => entry.url || entry.original_url);
 }
 
+function downloadFile(url, destination) {
+    return new Promise((resolve, reject) => {
+        const request = https.get(url, response => {
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                response.resume();
+                downloadFile(response.headers.location, destination).then(resolve, reject);
+                return;
+            }
+
+            if (response.statusCode !== 200) {
+                response.resume();
+                reject(new Error(`yt-dlp download failed with HTTP ${response.statusCode}`));
+                return;
+            }
+
+            fs.mkdirSync(path.dirname(destination), { recursive: true });
+            const writer = fs.createWriteStream(destination);
+            response.pipe(writer);
+            writer.on('finish', () => writer.close(resolve));
+            writer.on('error', reject);
+        });
+        request.setTimeout(30000, () => {
+            request.destroy(new Error('yt-dlp download timed out'));
+        });
+        request.on('error', reject);
+    });
+}
+
+async function ensureYtDlp() {
+    if (!fs.existsSync(ytDlpPath)) {
+        const filename = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+        await downloadFile(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${filename}`, ytDlpPath);
+        if (process.platform !== 'win32') {
+            fs.chmodSync(ytDlpPath, 0o755);
+        }
+    }
+
+    return ytDlpPath;
+}
+
+function runYtDlp(url) {
+    return ensureYtDlp().then(executable => new Promise((resolve, reject) => {
+            const child = execFile(executable, [url, '--dump-single-json', '--no-warnings', '--skip-download', '--quiet'],
+                { maxBuffer: 10 * 1024 * 1024, timeout: 60000 },
+                (error, stdout, stderr) => {
+                    if (error) {
+                        reject(new Error(stderr.trim() || error.message));
+                        return;
+                    }
+                    resolve(JSON.parse(stdout));
+                });
+            child.on('error', reject);
+        }));
+}
+
 async function extractXMedia(url) {
     const match = new URL(url).pathname.match(/\/status\/(\d+)/);
     if (!match) {
@@ -59,8 +147,12 @@ async function extractXMedia(url) {
 
     const response = await axios.get(`https://api.fxtwitter.com/status/${match[1]}`, {
         timeout: 15000,
-        validateStatus: status => status >= 200 && status < 300
+        validateStatus: status => (status >= 200 && status < 300) || status === 404
     });
+    if (response.status === 404 || response.data?.code === 404) {
+        return [];
+    }
+
     const media = response.data?.tweet?.media?.all || [];
 
     return media
@@ -72,17 +164,16 @@ async function extractXMedia(url) {
 }
 
 async function extractPlatformMedia(url) {
-    try {
-        const info = await ytDlp(url, {
-            dumpSingleJson: true,
-            noWarnings: true,
-            skipDownload: true,
-            quiet: true
-        });
+    const hostname = new URL(url).hostname.toLowerCase();
+    if (hostname === 'x.com' || hostname === 'www.x.com' ||
+        hostname === 'twitter.com' || hostname === 'www.twitter.com') {
+        return extractXMedia(url);
+    }
 
+    try {
+        const info = await runYtDlp(url);
         return getMediaEntries(info);
     } catch (error) {
-        const hostname = new URL(url).hostname.toLowerCase();
         if (hostname === 'x.com' || hostname === 'www.x.com' ||
             hostname === 'twitter.com' || hostname === 'www.twitter.com') {
             return extractXMedia(url);
@@ -112,7 +203,7 @@ async function convertMedia(interaction, { fileUrl, fileExt, width, height, cust
         }
 
         if (!fileExt) {
-            await interaction.editReply('Format not supported.');
+            await sendResult(interaction, 'Format not supported.');
             return;
         }
 
@@ -141,11 +232,12 @@ async function convertMedia(interaction, { fileUrl, fileExt, width, height, cust
                 .resize(width, height, { fit: 'fill' })
                 .toFile(outputPath);
         } else {
-            await interaction.editReply('Format not supported!');
+            await sendResult(interaction, 'Format not supported!');
             return;
         }
 
-        await interaction.editReply({ content: 'Done.', files: [outputPath], components: [] });
+        console.log(`[CONVERT] Media converted: ${outputPath}`);
+        await sendResult(interaction, { content: 'Done.', files: [outputPath], components: [] });
     } finally {
         cleanupFiles(inputPath, outputPath);
     }
@@ -162,7 +254,14 @@ module.exports = {
         .addStringOption(option => option.setName('name').setDescription('file output name (without extension)').setRequired(false)),
     
     async execute(interaction) {
-        await interaction.deferReply();
+        console.log(`[CONVERT] Starting interaction ${interaction.id}`);
+        await interaction.reply({ content: 'Processing media...', ephemeral: true });
+        console.log(`[CONVERT] Interaction acknowledged ${interaction.id}`);
+        if (interaction.channel?.send) {
+            await interaction.channel.send(
+                `<@${interaction.user.id}> running a \`/convert\`. Processing...`
+            );
+        }
         const attachment = interaction.options.getAttachment('file');
         const url = interaction.options.getString('url')?.trim();
         const width = interaction.options.getInteger('width');
@@ -170,12 +269,12 @@ module.exports = {
         let customName = interaction.options.getString('name');
 
         if (!attachment && !url) {
-            await interaction.editReply('Send files or fill in image/video links in the `file` or `url` options.');
+            await sendResult(interaction, 'Send files or fill in image/video links in the `file` or `url` options.');
             return;
         }
 
         if (attachment && url) {
-            await interaction.editReply('Choose one: file or url.');
+            await sendResult(interaction, 'Choose one: file or url.');
             return;
         }
 
@@ -187,26 +286,33 @@ module.exports = {
 
         try {
             if (url) {
+                console.log(`[CONVERT] URL received for ${interaction.id}`);
                 let parsedUrl;
                 try {
                     parsedUrl = new URL(url);
                 } catch {
-                    await interaction.editReply('Link not valid.');
+                    await sendResult(interaction, 'Link not valid.');
                     return;
                 }
 
                 if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-                    await interaction.editReply('Link must use http or https.');
+                    await sendResult(interaction, 'Link must use http or https.');
                     return;
                 }
 
                 fileUrl = parsedUrl.toString();
                 if (isPlatformUrl(fileUrl)) {
-                    await interaction.editReply('Wait for a moment...');
-                    const media = await extractPlatformMedia(fileUrl);
+                    console.log(`[CONVERT] Platform URL detected: ${parsedUrl.hostname}`);
+                    console.log(`[CONVERT] Fetching platform media for ${interaction.id}`);
+                    const media = await withTimeout(
+                        extractPlatformMedia(fileUrl),
+                        45000,
+                        'Platform media extraction timed out'
+                    );
+                    console.log(`[CONVERT] Platform media found: ${media.length}`);
 
                     if (!media.length) {
-                        await interaction.editReply('No media was found in the post.');
+                        await sendResult(interaction, 'No media was found in the post.');
                         return;
                     }
 
@@ -231,7 +337,7 @@ module.exports = {
                         for (let index = 0; index < buttons.length; index += 5) {
                             rows.push(new ActionRowBuilder().addComponents(buttons.slice(index, index + 5)));
                         }
-                        await interaction.editReply({
+                        await sendResult(interaction, {
                             content: `The post has ${media.length} media. Select the media you want to convert:`,
                             components: rows
                         });
@@ -243,10 +349,16 @@ module.exports = {
                 }
             }
 
-            await convertMedia(interaction, { fileUrl, fileExt, width, height, customName });
+            await withTimeout(
+                convertMedia(interaction, { fileUrl, fileExt, width, height, customName }),
+                90000,
+                'Media conversion timed out'
+            );
         } catch (error) {
-            console.error(error);
-            await interaction.editReply('Failed to fetch or convert media.');
+            if (error.response?.status !== 404) {
+                console.error(error);
+            }
+            await sendResult(interaction, 'Failed to fetch or convert media. Please try a direct media link or upload the file.');
         }
     },
 
@@ -265,7 +377,7 @@ module.exports = {
 
         const media = selection.media[Number(indexText)];
         pendingSelections.delete(token);
-        await interaction.deferUpdate();
+        await interaction.reply({ content: 'Processing selected media...', ephemeral: true });
         await convertMedia(interaction, {
             fileUrl: media.url || media.original_url,
             fileExt: media.ext ? `.${media.ext}` : '',
