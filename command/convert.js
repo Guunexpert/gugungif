@@ -12,7 +12,8 @@ const pendingSelections = new Map();
 const platformHosts = new Set([
     'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com',
     'instagram.com', 'www.instagram.com',
-    'facebook.com', 'www.facebook.com', 'fb.watch'
+    'facebook.com', 'www.facebook.com', 'fb.watch',
+    'pin.it', 'www.pin.it', 'pinterest.com', 'www.pinterest.com'
 ]);
 const ytDlpPath = path.join(__dirname, '../', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
@@ -82,6 +83,50 @@ function getMediaEntries(info) {
     const entries = (info.entries || []).flatMap(entry => entry.entries || entry);
     const mediaEntries = entries.length ? entries : [info];
     return mediaEntries.filter(entry => entry.url || entry.original_url);
+}
+
+function decodeHtml(value) {
+    return value
+        .replace(/&amp;/g, '&')
+        .replace(/&quot;/g, '"')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#39;/g, "'");
+}
+
+function getMetaContent(html, property) {
+    const pattern = new RegExp(
+        `<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["']`,
+        'i'
+    );
+    const reversePattern = new RegExp(
+        `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${property}["']`,
+        'i'
+    );
+    const match = html.match(pattern) || html.match(reversePattern);
+    return match ? decodeHtml(match[1]) : null;
+}
+
+async function extractPinterestMedia(url) {
+    const response = await axios.get(url, {
+        timeout: 15000,
+        maxRedirects: 5,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        validateStatus: status => status >= 200 && status < 300
+    });
+    const media = [
+        { url: getMetaContent(response.data, 'og:video'), ext: 'mp4' },
+        { url: getMetaContent(response.data, 'og:video:secure_url'), ext: 'mp4' },
+        { url: getMetaContent(response.data, 'og:image'), ext: 'jpg' }
+    ];
+    const uniqueUrls = new Set();
+
+    return media.filter(item => {
+        if (!item.url || uniqueUrls.has(item.url)) {
+            return false;
+        }
+        uniqueUrls.add(item.url);
+        return true;
+    });
 }
 
 function downloadFile(url, destination) {
@@ -169,6 +214,8 @@ async function extractPlatformMedia(url) {
         hostname === 'twitter.com' || hostname === 'www.twitter.com') {
         return extractXMedia(url);
     }
+    const isPinterest = hostname === 'pin.it' || hostname === 'www.pin.it' ||
+        hostname === 'pinterest.com' || hostname === 'www.pinterest.com';
 
     try {
         const info = await runYtDlp(url);
@@ -177,6 +224,9 @@ async function extractPlatformMedia(url) {
         if (hostname === 'x.com' || hostname === 'www.x.com' ||
             hostname === 'twitter.com' || hostname === 'www.twitter.com') {
             return extractXMedia(url);
+        }
+        if (isPinterest) {
+            return extractPinterestMedia(url);
         }
 
         throw error;
